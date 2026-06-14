@@ -1,7 +1,7 @@
 //@name socialrisu
 //@display-name sns_nai
 //@api 3.0
-//@version 0.9.2
+//@version 0.9.3
 //@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
@@ -11,6 +11,7 @@
 //   캐릭터는 setCharacter/setCharacterToIndex, 채팅은 setChatToIndex로 scoped write.
 //   getDatabase는 키 명시 read-only만. pluginStorage는 prefix namespace로 격리(전역 clear 금지).
 // 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.9.3 | ★이미지 생성 핵심 수정 3★ NAI 응답 처리 견고화. RisuAI 내부 매핑상 risuFetch=globalFetch는 표준 Response가 아니라 {ok,data,status} 객체를 반환하고, nativeFetch=fetchNative는 iOS 네이티브에서 Response가 아닌 객체를 줘서 .text()/.arrayBuffer() 호출이 "is not a function"으로 터졌음(스샷 확인). 이제 risuFetch를 무조건 우선 사용(globalFetch는 항상 존재)하고, 응답을 형태 불문(Response·객체 모두)으로 안전하게 읽어 바이너리/에러본문 추출. 빈 응답도 명확히 에러 표시
 // @sr-changelog 0.9.2 | ★이미지 생성 핵심 수정 2★ NAI 호출 전송 계층을 nativeFetch→risuFetch(=globalFetch)로 교체. 본체 "기타 봇>이미지 생성"이 NAI를 정상 호출하는 경로가 바로 globalFetch이며 CORS 우회·프록시 지원으로 iOS(아이폰)에서도 동작. nativeFetch는 iOS RisuAI WebView에서 바이너리 전송이 깨져 이미지 생성이 통째로 실패했음. body는 평문 객체로 넘기고 rawResponse:true로 ZIP 바이너리 수신
 // @sr-changelog 0.9.1 | ★이미지 생성 핵심 수정★ NAI 엔드포인트 URL 설정칸 추가 — 플러그인이 본체 "기타 봇>이미지 생성"의 NAIImgUrl을 직접 못 읽으므로(allowedDbKeys 제외), 본체와 동일한 URL(프록시/커스텀 포함)을 직접 입력하면 작동. 기존엔 image.novelai.net 하드코딩이라 프록시 사용자는 생성 불가였음
 // @sr-changelog 0.9.0 | 이미지 생성 실패 원인 표면화 — NAI 에러를 삼키지 않고 사용자에게 표시(401 키오류/402 구독필요/429 과다 힌트 포함). NAI 키 미설정·이미지태그 없음을 명확한 메시지로. (patch 10 → minor 롤오버: 0.8.9→0.9.0)
@@ -9244,63 +9245,75 @@ ${outputInstruction}`;
 
     this._lastNaiError = null;  // [sns_nai] 마지막 NAI 에러 저장 (계정 이미지 경로가 표면화)
     try {
-      // ⚠ 전송 계층: 반드시 risuFetch(=globalFetch)를 쓴다.
-      // nativeFetch는 아이폰(iOS) RisuAI 환경에서 NAI 호출이 실패한다(본체 LLM이 막혔던 것과 동일 원인).
-      // RisuAI 본체의 '기타 봇>이미지 생성'이 NAI를 정상 호출하는 경로가 바로 globalFetch이며,
-      // risuFetch는 CORS 우회 + 프록시 지원으로 iOS에서도 동작한다.
-      // body는 평문 객체로 넘긴다 — globalFetch가 JSON 직렬화 + Content-Type 자동 설정.
-      // rawResponse:true → res.data 가 Uint8Array(ZIP 바이너리).
-      const fetchFn = (typeof Risuai !== 'undefined' && typeof Risuai.risuFetch === 'function')
-        ? Risuai.risuFetch
-        : Risuai.nativeFetch;
-      const useRisu = fetchFn === Risuai.risuFetch;
+      // ★전송 계층★ NAI 바이너리 호출은 반드시 risuFetch(=globalFetch)로.
+      //  RisuAI 내부 매핑: risuFetch=globalFetch, nativeFetch=fetchNative.
+      //   - globalFetch는 { ok, data, status, headers } 평문 객체를 반환(Response 아님!).
+      //     rawResponse:true면 data가 Uint8Array(ZIP 바이너리). 본체 '기타 봇>이미지 생성'이
+      //     NAI를 호출하는 바로 그 경로 — iOS(아이폰)에서도 동작.
+      //   - fetchNative는 iOS 네이티브 빌드에서 표준 Response가 아닌 객체를 줘서
+      //     res.text()/res.arrayBuffer() 호출이 "is not a function"으로 터졌다(과거 버그).
+      //  → globalFetch는 oldApis에 항상 존재하므로 Risuai/Risu 어느 전역이든 risuFetch를 우선 사용.
+      //  body는 평문 객체로 — globalFetch가 JSON 직렬화 + Content-Type 자동.
+      const G = (typeof Risuai !== 'undefined' && Risuai) ? Risuai
+              : (typeof Risu !== 'undefined' && Risu) ? Risu
+              : null;
+      const rf = G && typeof G.risuFetch === 'function' ? G.risuFetch.bind(G) : null;
+      const nf = G && typeof G.nativeFetch === 'function' ? G.nativeFetch.bind(G) : null;
+      if (!rf && !nf) throw new Error('RisuAI fetch API(risuFetch/nativeFetch)를 찾을 수 없음');
 
-      let res, zipBytes;
-      if (useRisu) {
-        res = await fetchFn(this.naiEndpoint, {
+      // 응답을 형태 불문(Response vs {ok,data,status})으로 안전하게 읽는다.
+      const readBytes = async (r) => {
+        if (!r) return new Uint8Array(0);
+        if (typeof r.arrayBuffer === 'function') return new Uint8Array(await r.arrayBuffer());
+        let d = r.data;
+        if (d instanceof Uint8Array) return d;
+        if (d instanceof ArrayBuffer) return new Uint8Array(d);
+        if (Array.isArray(d)) return new Uint8Array(d);
+        if (d && d.buffer instanceof ArrayBuffer) return new Uint8Array(d.buffer);
+        return new Uint8Array(0);
+      };
+      const readErrText = async (r) => {
+        try {
+          if (!r) return '';
+          if (typeof r.text === 'function') return await r.text();
+          const d = r.data;
+          if (d instanceof Uint8Array) return new TextDecoder().decode(d);
+          if (typeof d === 'string') return d;
+          if (d) return JSON.stringify(d);
+        } catch (_) {}
+        return '';
+      };
+
+      let res;
+      if (rf) {
+        res = await rf(this.naiEndpoint, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${this.naiKey}` },
-          body,
-          rawResponse: true,
+          body,                 // 평문 객체
+          rawResponse: true,    // data = Uint8Array(ZIP)
         });
-        if (!res || !res.ok) {
-          const status = res ? res.status : 0;
-          let errText = '';
-          try {
-            const d = res && res.data;
-            if (d instanceof Uint8Array) errText = new TextDecoder().decode(d);
-            else if (typeof d === 'string') errText = d;
-            else if (d) errText = JSON.stringify(d);
-          } catch (_) {}
-          let hint = '';
-          if (status === 401) hint = ' (API 키 오류 — NovelAI 키 재확인)';
-          else if (status === 402) hint = ' (NovelAI Opus 구독/Anlas 필요)';
-          else if (status === 429) hint = ' (요청 과다 — 잠시 후 재시도)';
-          throw new Error(`NAI ${status}: ${String(errText).slice(0, 200)}${hint}`);
-        }
-        let d = res.data;
-        if (d instanceof ArrayBuffer) d = new Uint8Array(d);
-        else if (!(d instanceof Uint8Array)) d = new Uint8Array(d);
-        zipBytes = d;
       } else {
-        // 폴백(risuFetch 미노출 환경): 기존 nativeFetch 경로
-        res = await fetchFn(this.naiEndpoint, {
+        res = await nf(this.naiEndpoint, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.naiKey}`,
-          },
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.naiKey}` },
           body: JSON.stringify(body),
         });
-        if (!res.ok) {
-          const errText = await res.text();
-          let hint = '';
-          if (res.status === 401) hint = ' (API 키 오류 — NovelAI 키 재확인)';
-          else if (res.status === 402) hint = ' (NovelAI Opus 구독/Anlas 필요)';
-          else if (res.status === 429) hint = ' (요청 과다 — 잠시 후 재시도)';
-          throw new Error(`NAI ${res.status}: ${errText.slice(0, 200)}${hint}`);
-        }
-        zipBytes = new Uint8Array(await res.arrayBuffer());
+      }
+
+      const status = (res && typeof res.status === 'number') ? res.status : 0;
+      const okFlag = res && (res.ok === true || (status >= 200 && status < 300));
+      if (!okFlag) {
+        const errText = await readErrText(res);
+        let hint = '';
+        if (status === 401) hint = ' (API 키 오류 — NovelAI 키 재확인)';
+        else if (status === 402) hint = ' (NovelAI Opus 구독/Anlas 필요)';
+        else if (status === 429) hint = ' (요청 과다 — 잠시 후 재시도)';
+        throw new Error(`NAI ${status || '오류'}: ${String(errText).slice(0, 200)}${hint}`);
+      }
+
+      const zipBytes = await readBytes(res);
+      if (!zipBytes || zipBytes.length === 0) {
+        throw new Error('NAI 응답에 이미지 바이너리가 없음 (빈 응답)');
       }
       return this._extractPngFromZip(zipBytes);
     } catch (e) {
