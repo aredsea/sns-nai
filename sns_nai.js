@@ -1,12 +1,17 @@
 //@name socialrisu
 //@display-name sns_nai
 //@api 3.0
-//@version 0.8.8
+//@version 0.8.9
 //@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
 //@arg sr_autoupdate_mode string Auto-Update Mode (notify, off, auto)
+// ★보안 규칙(필수)★ Risu.setDatabase()/setDatabaseLite() 전체 DB 덮어쓰기 절대 금지 —
+//   getDatabase()는 plugins 필드 없는 stub을 반환하므로 setDatabase로 쓰면 모든 플러그인이 삭제됨.
+//   캐릭터는 setCharacter/setCharacterToIndex, 채팅은 setChatToIndex로 scoped write.
+//   getDatabase는 키 명시 read-only만. pluginStorage는 prefix namespace로 격리(전역 clear 금지).
 // 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.8.9 | 보안 점검 — setDatabase 전체 덮어쓰기 패턴 전수 검사(0건 확인, 구조적 안전). 헤더에 DB 쓰기 안전 규칙 명시(scoped write만, plugins 삭제 방지)
 // @sr-changelog 0.8.8 | 아이폰 LLM 연동 — Vertex provider를 본체 LLM 파이프라인(runLLMModel)으로 라우팅. 플러그인 직접 Vertex 호출 실패(iOS) 우회, 별도 service account JSON 입력 불필요. 본체 메인/보조 모델 설정을 그대로 사용(main→메인, light/verylight→보조). 콘텐츠 정책 프리앰블 보존
 // @sr-changelog 0.8.7 | GitHub 자동 버전관리 + lb-xnai 이미지태그 사전 매칭 개선(이름 괄호 분리·양방향 토큰 매칭 → 한글/영문 이중표기 캐릭터 매칭) + Asset Mommy 연동
 // @sr-changelog 0.8.6 | 작가 노트 — 캐릭터/계정별 작성 지시·이미지 연출 지시 4종(프로필·계정 편집에서 입력, 전 생성 경로 반영) + "이 계정을 아는 사람" 설정(비공개 계정의 정체를 아는 인물 지정 — 아는 NPC는 알고 반응, 모르는 NPC는 여전히 모름)
