@@ -46,5 +46,8 @@ sns_nai: SNS 계정 프로필/배경 → NAI 이미지 생성
 
 ## 버전 이력
 
+- `0.9.2`: ★NAI 이미지 생성 핵심 수정★ NAI 호출 전송 계층을 `nativeFetch`→`risuFetch`(=globalFetch)로 교체. 본체 "기타 봇>이미지 생성"이 NAI를 정상 호출하는 경로가 바로 globalFetch이며 CORS 우회·프록시 지원으로 아이폰(iOS)에서도 동작. nativeFetch는 iOS RisuAI WebView에서 바이너리 전송이 깨져 이미지 생성이 실패했음.
+- `0.9.1`: NAI 엔드포인트 URL 직접 입력칸 추가 (본체 NAIImgUrl을 못 읽는 문제 우회)
+- `0.9.0`: NAI 에러 표면화 (401/402/429 힌트)
 - `0.8.8`: 아이폰 LLM 연동 (Vertex → 본체 파이프라인)
 - `0.8.7`: GitHub 자동 버전관리 + lb-xnai 매칭 개선 + Asset Mommy 연동

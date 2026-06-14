@@ -1,7 +1,7 @@
 //@name socialrisu
 //@display-name sns_nai
 //@api 3.0
-//@version 0.9.1
+//@version 0.9.2
 //@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
@@ -11,6 +11,7 @@
 //   캐릭터는 setCharacter/setCharacterToIndex, 채팅은 setChatToIndex로 scoped write.
 //   getDatabase는 키 명시 read-only만. pluginStorage는 prefix namespace로 격리(전역 clear 금지).
 // 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.9.2 | ★이미지 생성 핵심 수정 2★ NAI 호출 전송 계층을 nativeFetch→risuFetch(=globalFetch)로 교체. 본체 "기타 봇>이미지 생성"이 NAI를 정상 호출하는 경로가 바로 globalFetch이며 CORS 우회·프록시 지원으로 iOS(아이폰)에서도 동작. nativeFetch는 iOS RisuAI WebView에서 바이너리 전송이 깨져 이미지 생성이 통째로 실패했음. body는 평문 객체로 넘기고 rawResponse:true로 ZIP 바이너리 수신
 // @sr-changelog 0.9.1 | ★이미지 생성 핵심 수정★ NAI 엔드포인트 URL 설정칸 추가 — 플러그인이 본체 "기타 봇>이미지 생성"의 NAIImgUrl을 직접 못 읽으므로(allowedDbKeys 제외), 본체와 동일한 URL(프록시/커스텀 포함)을 직접 입력하면 작동. 기존엔 image.novelai.net 하드코딩이라 프록시 사용자는 생성 불가였음
 // @sr-changelog 0.9.0 | 이미지 생성 실패 원인 표면화 — NAI 에러를 삼키지 않고 사용자에게 표시(401 키오류/402 구독필요/429 과다 힌트 포함). NAI 키 미설정·이미지태그 없음을 명확한 메시지로. (patch 10 → minor 롤오버: 0.8.9→0.9.0)
 // @sr-changelog 0.8.9 | 보안 점검 — setDatabase 전체 덮어쓰기 패턴 전수 검사(0건 확인, 구조적 안전). 헤더에 DB 쓰기 안전 규칙 명시(scoped write만, plugins 삭제 방지)
@@ -9243,26 +9244,64 @@ ${outputInstruction}`;
 
     this._lastNaiError = null;  // [sns_nai] 마지막 NAI 에러 저장 (계정 이미지 경로가 표면화)
     try {
-      const res = await Risuai.nativeFetch(this.naiEndpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.naiKey}`,
-        },
-        body: JSON.stringify(body),
-      });
+      // ⚠ 전송 계층: 반드시 risuFetch(=globalFetch)를 쓴다.
+      // nativeFetch는 아이폰(iOS) RisuAI 환경에서 NAI 호출이 실패한다(본체 LLM이 막혔던 것과 동일 원인).
+      // RisuAI 본체의 '기타 봇>이미지 생성'이 NAI를 정상 호출하는 경로가 바로 globalFetch이며,
+      // risuFetch는 CORS 우회 + 프록시 지원으로 iOS에서도 동작한다.
+      // body는 평문 객체로 넘긴다 — globalFetch가 JSON 직렬화 + Content-Type 자동 설정.
+      // rawResponse:true → res.data 가 Uint8Array(ZIP 바이너리).
+      const fetchFn = (typeof Risuai !== 'undefined' && typeof Risuai.risuFetch === 'function')
+        ? Risuai.risuFetch
+        : Risuai.nativeFetch;
+      const useRisu = fetchFn === Risuai.risuFetch;
 
-      if (!res.ok) {
-        const errText = await res.text();
-        // 흔한 원인 힌트
-        let hint = '';
-        if (res.status === 401) hint = ' (API 키 오류 — NovelAI 키 재확인)';
-        else if (res.status === 402) hint = ' (NovelAI Opus 구독/Anlas 필요)';
-        else if (res.status === 429) hint = ' (요청 과다 — 잠시 후 재시도)';
-        throw new Error(`NAI ${res.status}: ${errText.slice(0, 200)}${hint}`);
+      let res, zipBytes;
+      if (useRisu) {
+        res = await fetchFn(this.naiEndpoint, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${this.naiKey}` },
+          body,
+          rawResponse: true,
+        });
+        if (!res || !res.ok) {
+          const status = res ? res.status : 0;
+          let errText = '';
+          try {
+            const d = res && res.data;
+            if (d instanceof Uint8Array) errText = new TextDecoder().decode(d);
+            else if (typeof d === 'string') errText = d;
+            else if (d) errText = JSON.stringify(d);
+          } catch (_) {}
+          let hint = '';
+          if (status === 401) hint = ' (API 키 오류 — NovelAI 키 재확인)';
+          else if (status === 402) hint = ' (NovelAI Opus 구독/Anlas 필요)';
+          else if (status === 429) hint = ' (요청 과다 — 잠시 후 재시도)';
+          throw new Error(`NAI ${status}: ${String(errText).slice(0, 200)}${hint}`);
+        }
+        let d = res.data;
+        if (d instanceof ArrayBuffer) d = new Uint8Array(d);
+        else if (!(d instanceof Uint8Array)) d = new Uint8Array(d);
+        zipBytes = d;
+      } else {
+        // 폴백(risuFetch 미노출 환경): 기존 nativeFetch 경로
+        res = await fetchFn(this.naiEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.naiKey}`,
+          },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          let hint = '';
+          if (res.status === 401) hint = ' (API 키 오류 — NovelAI 키 재확인)';
+          else if (res.status === 402) hint = ' (NovelAI Opus 구독/Anlas 필요)';
+          else if (res.status === 429) hint = ' (요청 과다 — 잠시 후 재시도)';
+          throw new Error(`NAI ${res.status}: ${errText.slice(0, 200)}${hint}`);
+        }
+        zipBytes = new Uint8Array(await res.arrayBuffer());
       }
-
-      const zipBytes = new Uint8Array(await res.arrayBuffer());
       return this._extractPngFromZip(zipBytes);
     } catch (e) {
       this._lastNaiError = e && e.message ? e.message : String(e);
