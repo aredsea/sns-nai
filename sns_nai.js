@@ -1,7 +1,7 @@
 //@name socialrisu
-//@display-name sns_nai
+//@display-name sns_nai 0.9.4
 //@api 3.0
-//@version 0.9.3
+//@version 0.9.4
 //@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
@@ -11,6 +11,7 @@
 //   캐릭터는 setCharacter/setCharacterToIndex, 채팅은 setChatToIndex로 scoped write.
 //   getDatabase는 키 명시 read-only만. pluginStorage는 prefix namespace로 격리(전역 clear 금지).
 // 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.9.4 | display-name에 버전 표기(sns_nai 0.9.4) — 플러그인 목록에서 실제 로드된 버전 확인용. "res.text is not a function"이 계속 보이면 구버전(0.9.1↓)이 캐시돼 있다는 신호이니, 삭제 후 재import 필요(이미지 생성 코드는 0.9.3 견고화 유지). + 이미지 태그 사전 매칭 영속화 수정: ①매칭 시 canonicalName(예: "다온비")까지 프로필 alias로 저장 → 재스캔해도 미매칭으로 안 돌아감 ②수동 매핑 후 동기화 스냅샷 갱신 → 사전 재진입 시 "미매칭 N" 잔류 안 됨
 // @sr-changelog 0.9.3 | ★이미지 생성 핵심 수정 3★ NAI 응답 처리 견고화. RisuAI 내부 매핑상 risuFetch=globalFetch는 표준 Response가 아니라 {ok,data,status} 객체를 반환하고, nativeFetch=fetchNative는 iOS 네이티브에서 Response가 아닌 객체를 줘서 .text()/.arrayBuffer() 호출이 "is not a function"으로 터졌음(스샷 확인). 이제 risuFetch를 무조건 우선 사용(globalFetch는 항상 존재)하고, 응답을 형태 불문(Response·객체 모두)으로 안전하게 읽어 바이너리/에러본문 추출. 빈 응답도 명확히 에러 표시
 // @sr-changelog 0.9.2 | ★이미지 생성 핵심 수정 2★ NAI 호출 전송 계층을 nativeFetch→risuFetch(=globalFetch)로 교체. 본체 "기타 봇>이미지 생성"이 NAI를 정상 호출하는 경로가 바로 globalFetch이며 CORS 우회·프록시 지원으로 iOS(아이폰)에서도 동작. nativeFetch는 iOS RisuAI WebView에서 바이너리 전송이 깨져 이미지 생성이 통째로 실패했음. body는 평문 객체로 넘기고 rawResponse:true로 ZIP 바이너리 수신
 // @sr-changelog 0.9.1 | ★이미지 생성 핵심 수정★ NAI 엔드포인트 URL 설정칸 추가 — 플러그인이 본체 "기타 봇>이미지 생성"의 NAIImgUrl을 직접 못 읽으므로(allowedDbKeys 제외), 본체와 동일한 URL(프록시/커스텀 포함)을 직접 입력하면 작동. 기존엔 image.novelai.net 하드코딩이라 프록시 사용자는 생성 불가였음
@@ -9734,7 +9735,11 @@ class ExtraLoreApplier {
       style: (p.imageTags && p.imageTags.style) || 'anime',
     };
     const pname = p.realname || p.pkey || '';
-    const newAliases = (dict.aliases || []).filter(a =>
+    // ★재매칭 결정성★ canonicalName(예: "다온비")까지 alias로 영속화한다.
+    // 기존엔 dict.aliases(나머지 별칭)만 추가하고 canonical은 버려서, 재스캔 시
+    // resolve()가 한글/영문 토큰을 다시 못 찾고 "미매칭"으로 되돌아가는 버그가 있었다.
+    const allHeaderNames = [dict.canonicalName, ...(dict.aliases || [])];
+    const newAliases = allHeaderNames.filter(a =>
       a && a !== pname && !/\{\{\s*user\s*\}\}/i.test(a));
     if (newAliases.length) {
       p.aliases = [...new Set([...(p.aliases || []), ...newAliases])];
@@ -34653,6 +34658,19 @@ class sns_naiApp {
             `수동 매핑 완료 — 매칭 ${result.matched} · 덮어쓰기 ${result.overwritten}`,
             { type: 'success' }
           );
+          // ★스냅샷 갱신★ 수동 매핑은 기존엔 imageTagDict:lastSync를 안 건드려서,
+          // 사전 화면 재진입 시 "미매칭 N"이 그대로 남아 매칭이 안 된 것처럼 보였다.
+          // 수동 매칭한 수만큼 matched↑ / unmatched↓ 로 스냅샷을 병합한다.
+          try {
+            const prev = this.store.get('imageTagDict:lastSync') || {};
+            this.store.set('imageTagDict:lastSync', {
+              ...prev,
+              at: Date.now(),
+              matched: (prev.matched || 0) + (result.matched || 0),
+              overwritten: (prev.overwritten || 0) + (result.overwritten || 0),
+              unmatched: Math.max(0, (prev.unmatched || 0) - (result.matched || 0)),
+            });
+          } catch {}
         } catch (e) {
           if (e && e.message === 'CONTEXT_CHANGED') {
             this.showToast('캐릭터/채팅이 변경되어 매핑을 취소합니다', { type: 'warn' });
