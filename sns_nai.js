@@ -1,7 +1,7 @@
 //@name socialrisu
 //@display-name sns_nai
 //@api 3.0
-//@version 0.9.0
+//@version 0.9.1
 //@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
@@ -11,6 +11,7 @@
 //   캐릭터는 setCharacter/setCharacterToIndex, 채팅은 setChatToIndex로 scoped write.
 //   getDatabase는 키 명시 read-only만. pluginStorage는 prefix namespace로 격리(전역 clear 금지).
 // 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.9.1 | ★이미지 생성 핵심 수정★ NAI 엔드포인트 URL 설정칸 추가 — 플러그인이 본체 "기타 봇>이미지 생성"의 NAIImgUrl을 직접 못 읽으므로(allowedDbKeys 제외), 본체와 동일한 URL(프록시/커스텀 포함)을 직접 입력하면 작동. 기존엔 image.novelai.net 하드코딩이라 프록시 사용자는 생성 불가였음
 // @sr-changelog 0.9.0 | 이미지 생성 실패 원인 표면화 — NAI 에러를 삼키지 않고 사용자에게 표시(401 키오류/402 구독필요/429 과다 힌트 포함). NAI 키 미설정·이미지태그 없음을 명확한 메시지로. (patch 10 → minor 롤오버: 0.8.9→0.9.0)
 // @sr-changelog 0.8.9 | 보안 점검 — setDatabase 전체 덮어쓰기 패턴 전수 검사(0건 확인, 구조적 안전). 헤더에 DB 쓰기 안전 규칙 명시(scoped write만, plugins 삭제 방지)
 // @sr-changelog 0.8.8 | 아이폰 LLM 연동 — Vertex provider를 본체 LLM 파이프라인(runLLMModel)으로 라우팅. 플러그인 직접 Vertex 호출 실패(iOS) 우회, 별도 service account JSON 입력 불필요. 본체 메인/보조 모델 설정을 그대로 사용(main→메인, light/verylight→보조). 콘텐츠 정책 프리앰블 보존
@@ -8238,6 +8239,11 @@ class ImageGenerator {
     this.enabled = !!(await Risuai.pluginStorage.getItem('image_gen_enabled'));
     const model = await Risuai.pluginStorage.getItem('nai_model');
     if (model) this.naiModel = model;
+    // [sns_nai] NovelAI 엔드포인트 URL — 본체 "기타 봇 > 이미지 생성"의 NAIImgUrl과
+    // 동일하게 맞출 수 있도록 설정 가능. 플러그인은 본체 설정을 직접 못 읽으므로(allowedDbKeys 제외)
+    // 사용자가 같은 URL을 입력해야 프록시/커스텀 엔드포인트가 작동.
+    const endpointUrl = await Risuai.pluginStorage.getItem('nai_endpoint_url');
+    if (endpointUrl && /^https?:\/\//.test(endpointUrl.trim())) this.naiEndpoint = endpointUrl.trim();
     this.imageParams = this._normalizeImageParams({
       sampler: await Risuai.pluginStorage.getItem('nai_sampler'),
       noiseSchedule: await Risuai.pluginStorage.getItem('nai_noise_schedule'),
@@ -8250,7 +8256,7 @@ class ImageGenerator {
     await this.loadPresets();
   }
 
-  async saveSettings(naiKey, enabled, model, imageParams) {
+  async saveSettings(naiKey, enabled, model, imageParams, endpointUrl) {
     if (naiKey !== undefined) {
       this.naiKey = naiKey || null;
       await Risuai.pluginStorage.setItem('nai_api_key', naiKey || '');
@@ -8262,6 +8268,17 @@ class ImageGenerator {
     if (model) {
       this.naiModel = model;
       await Risuai.pluginStorage.setItem('nai_model', model);
+    }
+    // [sns_nai] 엔드포인트 URL 저장 (빈값이면 기본 공식 URL로 복귀)
+    if (endpointUrl !== undefined) {
+      const u = (endpointUrl || '').trim();
+      if (u && /^https?:\/\//.test(u)) {
+        this.naiEndpoint = u;
+        await Risuai.pluginStorage.setItem('nai_endpoint_url', u);
+      } else {
+        this.naiEndpoint = 'https://image.novelai.net/ai/generate-image';
+        await Risuai.pluginStorage.setItem('nai_endpoint_url', '');
+      }
     }
     if (imageParams !== undefined) {
       this.imageParams = this._normalizeImageParams(imageParams);
@@ -36531,6 +36548,11 @@ class sns_naiApp {
     section.appendChild(imgToggleWrap);
 
     const naiKeyInput = this._makeSettingsInput('NAI API 키', this.imageGen?.naiKey || '', 'Bearer token', 'password');
+    // [sns_nai] 엔드포인트 URL — 본체 "기타 봇 > 이미지 생성"의 URL과 동일하게 입력.
+    // 프록시/커스텀 URL을 쓰는 경우 반드시 같은 값을 넣어야 작동(비우면 공식 URL).
+    const defaultNaiUrl = 'https://image.novelai.net/ai/generate-image';
+    const curNaiUrl = (this.imageGen?.naiEndpoint && this.imageGen.naiEndpoint !== defaultNaiUrl) ? this.imageGen.naiEndpoint : '';
+    const naiUrlInput = this._makeSettingsInput('NAI 엔드포인트 URL (본체 설정과 동일하게)', curNaiUrl, defaultNaiUrl);
     const naiModelInput = this._makeSettingsInput('NAI 모델', this.imageGen?.naiModel || '', 'nai-diffusion-4-5-full');
     const imgParams = this.imageGen?.getImageParams?.() || {
       sampler: 'k_euler_ancestral',
@@ -36560,6 +36582,7 @@ class sns_naiApp {
     globalSeedInput.inp.max = '4294967295';
     globalSeedInput.inp.step = '1';
     section.appendChild(naiKeyInput.wrap);
+    section.appendChild(naiUrlInput.wrap);
     section.appendChild(naiModelInput.wrap);
     section.appendChild(samplerInput.wrap);
     section.appendChild(noiseInput.wrap);
@@ -36587,6 +36610,7 @@ class sns_naiApp {
           cfgRescale: cfgRescaleInput.inp.value,
           globalSeed: globalSeedRaw === '' ? null : globalSeedRaw,
         },
+        naiUrlInput.inp.value.trim(),
       );
       imgSaveBtn.textContent = '저장됨';
       setTimeout(() => { imgSaveBtn.textContent = '이미지 설정 저장'; imgSaveBtn.disabled = false; }, 1500);
