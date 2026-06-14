@@ -1,7 +1,7 @@
 //@name socialrisu
 //@display-name sns_nai
 //@api 3.0
-//@version 0.8.9
+//@version 0.9.0
 //@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
@@ -11,6 +11,7 @@
 //   캐릭터는 setCharacter/setCharacterToIndex, 채팅은 setChatToIndex로 scoped write.
 //   getDatabase는 키 명시 read-only만. pluginStorage는 prefix namespace로 격리(전역 clear 금지).
 // 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.9.0 | 이미지 생성 실패 원인 표면화 — NAI 에러를 삼키지 않고 사용자에게 표시(401 키오류/402 구독필요/429 과다 힌트 포함). NAI 키 미설정·이미지태그 없음을 명확한 메시지로. (patch 10 → minor 롤오버: 0.8.9→0.9.0)
 // @sr-changelog 0.8.9 | 보안 점검 — setDatabase 전체 덮어쓰기 패턴 전수 검사(0건 확인, 구조적 안전). 헤더에 DB 쓰기 안전 규칙 명시(scoped write만, plugins 삭제 방지)
 // @sr-changelog 0.8.8 | 아이폰 LLM 연동 — Vertex provider를 본체 LLM 파이프라인(runLLMModel)으로 라우팅. 플러그인 직접 Vertex 호출 실패(iOS) 우회, 별도 service account JSON 입력 불필요. 본체 메인/보조 모델 설정을 그대로 사용(main→메인, light/verylight→보조). 콘텐츠 정책 프리앰블 보존
 // @sr-changelog 0.8.7 | GitHub 자동 버전관리 + lb-xnai 이미지태그 사전 매칭 개선(이름 괄호 분리·양방향 토큰 매칭 → 한글/영문 이중표기 캐릭터 매칭) + Asset Mommy 연동
@@ -9223,6 +9224,7 @@ ${outputInstruction}`;
       },
     };
 
+    this._lastNaiError = null;  // [sns_nai] 마지막 NAI 에러 저장 (계정 이미지 경로가 표면화)
     try {
       const res = await Risuai.nativeFetch(this.naiEndpoint, {
         method: 'POST',
@@ -9235,13 +9237,19 @@ ${outputInstruction}`;
 
       if (!res.ok) {
         const errText = await res.text();
-        throw new Error(`NAI ${res.status}: ${errText.slice(0, 200)}`);
+        // 흔한 원인 힌트
+        let hint = '';
+        if (res.status === 401) hint = ' (API 키 오류 — NovelAI 키 재확인)';
+        else if (res.status === 402) hint = ' (NovelAI Opus 구독/Anlas 필요)';
+        else if (res.status === 429) hint = ' (요청 과다 — 잠시 후 재시도)';
+        throw new Error(`NAI ${res.status}: ${errText.slice(0, 200)}${hint}`);
       }
 
       const zipBytes = new Uint8Array(await res.arrayBuffer());
       return this._extractPngFromZip(zipBytes);
     } catch (e) {
-      console.error('[sns_nai] NAI API error:', e.message);
+      this._lastNaiError = e && e.message ? e.message : String(e);
+      console.error('[sns_nai] NAI API error:', this._lastNaiError);
       return null;
     }
   }
@@ -32888,15 +32896,17 @@ class sns_naiApp {
 
   async _generateAccountImageAssetsForDraft(acc) {
     const imageErrors = [];
-    if (!this.imageGen?.enabled || !this.imageGen?.naiKey) return imageErrors;
+    if (!this.imageGen?.enabled) return ['이미지 생성 비활성화'];
+    if (!this.imageGen?.naiKey) return ['NovelAI API 키 미설정'];
 
     const defaultNeg = 'lowres, bad anatomy, bad hands, missing fingers, blurry, watermark';
     const ownerProfile = acc?.profileId ? (this.profiles?.get?.(acc.profileId) || this.profiles?.resolve?.(acc.profileId) || null) : null;
+    const naiErr = () => this.imageGen?._lastNaiError ? `: ${this.imageGen._lastNaiError}` : ' (원인 불명 — 콘솔 확인)';
     if (acc.profileImageTags) {
       try {
         const profilePath = await this.imageGen.generateFromTags(acc.profileImageTags, 'square', { presetId: this.contextConfig?.defaultImagePresetId || '', negTags: defaultNeg, subjectProfile: ownerProfile });
         if (profilePath) acc.profileImageAssetPath = profilePath;
-        else imageErrors.push('프로필 이미지');
+        else imageErrors.push(`프로필 이미지${naiErr()}`);
       } catch (e) {
         imageErrors.push(`프로필 이미지: ${e.message || e}`);
       }
@@ -32905,7 +32915,7 @@ class sns_naiApp {
       try {
         const bannerPath = await this.imageGen.generateFromTags(acc.bannerImageTags, 'landscape', { presetId: this.contextConfig?.defaultImagePresetId || '', negTags: defaultNeg, subjectProfile: ownerProfile });
         if (bannerPath) acc.bannerImageAssetPath = bannerPath;
-        else imageErrors.push('배경 이미지');
+        else imageErrors.push(`배경 이미지${naiErr()}`);
       } catch (e) {
         imageErrors.push(`배경 이미지: ${e.message || e}`);
       }
@@ -33250,7 +33260,9 @@ class sns_naiApp {
 
   async _generateAccountImages(accountId, opts = {}) {
     const imageErrors = [];
-    if (!this.imageGen?.enabled || !this.imageGen?.naiKey) return imageErrors;
+    // [sns_nai] 비활성화/키 미설정을 조용히 넘기지 말고 명확히 알림.
+    if (!this.imageGen?.enabled) return ['이미지 생성이 비활성화됨 — 설정에서 이미지 생성을 켜세요'];
+    if (!this.imageGen?.naiKey) return ['NovelAI API 키 미설정 — 설정 → 이미지 생성에서 NAI 키를 입력하세요'];
     const registry = this._getAccountRegistry();
     if (!registry) return ['AccountRegistry 없음'];
     const acc = registry.getAll().find(a => a.id === accountId);
@@ -33259,11 +33271,16 @@ class sns_naiApp {
 
     const defaultNeg = 'lowres, bad anatomy, bad hands, missing fingers, blurry, watermark';
     const ownerProfile = acc?.profileId ? (this.profiles?.get?.(acc.profileId) || this.profiles?.resolve?.(acc.profileId) || null) : null;
+    // [sns_nai] 생성할 태그가 아예 없으면 명확히 — imageTags 매칭/프로필 누락 진단
+    if (!acc.profileImageTags && !acc.bannerImageTags) {
+      return ['이미지 태그 없음 — 이미지 태그 사전 동기화 또는 프로필 imageTags를 먼저 채우세요'];
+    }
+    const naiErr = () => this.imageGen?._lastNaiError ? `: ${this.imageGen._lastNaiError}` : ' (원인 불명 — 콘솔 로그 확인)';
     if (acc.profileImageTags && (!onlyMissing || !acc.profileImageAssetPath)) {
       try {
         const profilePath = await this.imageGen.generateFromTags(acc.profileImageTags, 'square', { presetId: this.contextConfig?.defaultImagePresetId || '', negTags: defaultNeg, subjectProfile: ownerProfile });
         if (profilePath) registry.update(accountId, { profileImageAssetPath: profilePath });
-        else imageErrors.push('프로필 이미지');
+        else imageErrors.push(`프로필 이미지${naiErr()}`);
       } catch (e) {
         imageErrors.push(`프로필 이미지: ${e.message || e}`);
       }
@@ -33272,7 +33289,7 @@ class sns_naiApp {
       try {
         const bannerPath = await this.imageGen.generateFromTags(acc.bannerImageTags, 'landscape', { presetId: this.contextConfig?.defaultImagePresetId || '', negTags: defaultNeg, subjectProfile: ownerProfile });
         if (bannerPath) registry.update(accountId, { bannerImageAssetPath: bannerPath });
-        else imageErrors.push('배경 이미지');
+        else imageErrors.push(`배경 이미지${naiErr()}`);
       } catch (e) {
         imageErrors.push(`배경 이미지: ${e.message || e}`);
       }
