@@ -1,12 +1,14 @@
 //@name socialrisu
 //@display-name sns_nai
 //@api 3.0
-//@version 0.8.7
-//@author EVSkyFall (sns_nai fork)
+//@version 0.8.8
+//@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
 //@arg sr_autoupdate_mode string Auto-Update Mode (notify, off, auto)
-// @sr-changelog 0.8.7 | sns_nai 리네임(SocialRisu 파생) + GitHub 자동 버전관리 + lb-xnai 이미지태그 사전 매칭 개선(이름 괄호 분리·양방향 토큰 매칭 → 한글/영문 이중표기 캐릭터 매칭) + Asset Mommy 연동
+// 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.8.8 | 아이폰 LLM 연동 — Vertex provider를 본체 LLM 파이프라인(runLLMModel)으로 라우팅. 플러그인 직접 Vertex 호출 실패(iOS) 우회, 별도 service account JSON 입력 불필요. 본체 메인/보조 모델 설정을 그대로 사용(main→메인, light/verylight→보조). 콘텐츠 정책 프리앰블 보존
+// @sr-changelog 0.8.7 | GitHub 자동 버전관리 + lb-xnai 이미지태그 사전 매칭 개선(이름 괄호 분리·양방향 토큰 매칭 → 한글/영문 이중표기 캐릭터 매칭) + Asset Mommy 연동
 // @sr-changelog 0.8.6 | 작가 노트 — 캐릭터/계정별 작성 지시·이미지 연출 지시 4종(프로필·계정 편집에서 입력, 전 생성 경로 반영) + "이 계정을 아는 사람" 설정(비공개 계정의 정체를 아는 인물 지정 — 아는 NPC는 알고 반응, 모르는 NPC는 여전히 모름)
 // @sr-changelog 0.8.5 | 갤러리 앱 신설 — 채팅에서 생성된 모든 사진(포스트/메신저/X DM/데이트)을 바둑판으로 모아보고, 풀스크린 뷰어·선택 대량 삭제(원본에서도 제거+저장공간 회수) + 데이트 장면 사진 크기 선택(5종 비율, 마지막 선택 기억)
 // @sr-changelog 0.8.4 | 데이트 모드 전모드 확장(관전방·그룹 모임·X DM, 입력 4모드[직접/대필/디렉팅/관전]·데이트 오토디렉터·메타 편집·종료 제안·장면 사진[크기 선택]) + 프라이버시 강화(메인 모델 로어북 ground truth 격리, X DM 상대의 내 정보 인지 차단·실명→표시명) + 이미지 rating 수위 다이얼 복원 + X DM 답장 화자·수위 버그 수정
@@ -1751,8 +1753,9 @@ class LLMClient {
     const cfg = this._resolve(tier);
 
     if (cfg.provider === 'vertex') {
-      if (!cfg.vertexKeyJson) throw new Error(`No Vertex service account for ${tier}. Configure in Settings.`);
-      return this._generateVertex(cfg, tier, systemPrompt, userPrompt, opts);
+      // [sns_nai] 플러그인 직접 Vertex 호출 대신 본체 LLM 파이프라인으로 (아이폰 호환).
+      // 별도 service account JSON 입력 불필요 — 본체 메인/보조 모델 설정을 사용.
+      return this._generateRisuCore(cfg, tier, systemPrompt, userPrompt, opts);
     }
 
     if (!cfg.apiKey) throw new Error(`No API key for ${tier}. Configure in Settings.`);
@@ -1773,8 +1776,8 @@ class LLMClient {
 
       let result;
       if (cfg.provider === 'vertex') {
-        if (!cfg.vertexKeyJson) throw new Error(`No Vertex service account for ${tier}. Configure in Settings.`);
-        result = await this._generateVertex(cfg, tier, 'Respond briefly.', 'Say hi', opts);
+        // [sns_nai] 본체 LLM 파이프라인 경로로 연결 테스트
+        result = await this._generateRisuCore(cfg, tier, 'Respond briefly.', 'Say hi', opts);
       } else {
         if (!cfg.apiKey) throw new Error(`No API key for ${tier}. Configure in Settings.`);
         result = await this._generateOpenAI(cfg, tier, '', 'Say hi', opts);
@@ -1912,6 +1915,41 @@ class LLMClient {
       console.log(`[sns_nai] ${response.status} — retry ${attempt + 1}/${maxRetries} in ${Math.round(delayMs + jitter)}ms`);
       await new Promise(r => setTimeout(r, delayMs + jitter));
     }
+  }
+
+  // [sns_nai] Vertex provider를 RisuAI 본체 LLM 파이프라인(Risuai.runLLMModel)으로 라우팅.
+  // 아이폰(iOS WebKit)에서 플러그인이 직접 Vertex를 호출하면 실패하는 문제 우회 —
+  // 본체가 이미 검증한 LLM 설정을 그대로 사용. 메시지를 정리해 넘기고, 플러그인이
+  // 기대하는 형식(text / {text,tokens,usage})으로 반환. 콘텐츠 정책 프리앰블도 보존.
+  async _generateRisuCore(cfg, tier, systemPrompt, userPrompt, opts) {
+    if (typeof Risuai.runLLMModel !== 'function') {
+      throw new Error('Risuai.runLLMModel 미지원 — 본체 LLM API가 있는 RisuAI 빌드로 업데이트하세요.');
+    }
+    const norm = this._normalizeMessages(systemPrompt, userPrompt, opts);
+    const chats = norm.map(m => {
+      const role = m.role === 'model' ? 'assistant' : (m.role || 'user');
+      let content = this._textFromContent(m.content);
+      if (role === 'system') {
+        content = [VERTEX_CONTENT_POLICY, content].filter(Boolean).join('\n\n');
+      }
+      return { role, content };
+    }).filter(m => m.content);
+    if (!chats.some(m => m.role === 'system') && VERTEX_CONTENT_POLICY) {
+      chats.unshift({ role: 'system', content: VERTEX_CONTENT_POLICY });
+    }
+    if (!chats.some(m => m.role !== 'system')) {
+      chats.push({ role: 'user', content: String(userPrompt || 'Continue.') });
+    }
+    // tier 매핑: main → 본체 메인 모델, light/verylight → 본체 보조 모델
+    const mode = tier === 'main' ? 'model' : 'submodel';
+    const res = await Risuai.runLLMModel({ mode, messages: chats, allowPlugins: false });
+    if (!res || res.type !== 'success') {
+      const detail = typeof res?.result === 'string' ? res.result.slice(0, 300) : JSON.stringify(res ?? null).slice(0, 300);
+      throw new Error(`LLM(RisuCore) [${tier}/${mode}] 실패: ${detail}`);
+    }
+    const text = (typeof res.result === 'string' ? res.result : String(res.result ?? '')).trim();
+    if (opts.returnMeta) return { text, tokens: null, usage: null };
+    return text;
   }
 
   async _generateOpenAI(cfg, tier, systemPrompt, userPrompt, opts) {
@@ -37210,8 +37248,9 @@ class sns_naiApp {
       // 프로필 탭에서 이관: 빌드 전 LLM 키 사전 점검 (verylight=로어 추출, light=그래프 정리)
       const vlCfg = this.llm._resolve('verylight');
       const lCfg = this.llm._resolve('light');
-      const vlOk = vlCfg.provider === 'vertex' ? !!vlCfg.vertexKeyJson : !!vlCfg.apiKey;
-      const lOk = lCfg.provider === 'vertex' ? !!lCfg.vertexKeyJson : !!lCfg.apiKey;
+      // [sns_nai] vertex는 본체 LLM 파이프라인 사용 — 별도 키 불필요(항상 OK)
+      const vlOk = vlCfg.provider === 'vertex' ? true : !!vlCfg.apiKey;
+      const lOk = lCfg.provider === 'vertex' ? true : !!lCfg.apiKey;
       if (!vlOk || !lOk) {
         fullBuildBtn.textContent = 'API 키를 먼저 설정하세요';
         this.showToast('로어 분석을 위해 LLM API 키를 먼저 설정하세요.', {
