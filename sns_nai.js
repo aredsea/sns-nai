@@ -1,7 +1,7 @@
 //@name socialrisu
-//@display-name sns_nai 0.9.4
+//@display-name sns_nai 0.9.5
 //@api 3.0
-//@version 0.9.4
+//@version 0.9.5
 //@author aredsea
 //@update-url https://raw.githubusercontent.com/aredsea/sns-nai/main/sns_nai.js
 //@arg deepseek_api_key string DeepSeek API Key (optional)
@@ -11,6 +11,7 @@
 //   캐릭터는 setCharacter/setCharacterToIndex, 채팅은 setChatToIndex로 scoped write.
 //   getDatabase는 키 명시 read-only만. pluginStorage는 prefix namespace로 격리(전역 clear 금지).
 // 버전 규칙: patch가 10이 되면 minor로 올림 (예: 0.8.9 → 0.9.0). Asset Mommy와 동일.
+// @sr-changelog 0.9.5 | ★Asset Mommy 연동 — 캐릭터 레퍼런스★ Asset Mommy 줌 갤러리에서 "SNS 레퍼런스" 지정 시 캐릭터 로어북(lb-xnai.ref)에 저장된 이미지를 sns_nai가 읽어 NAI director reference로 사용. 그림체+캐릭터 유지한 채 상황(태그)만 변동. 캐릭터당 1장, NAI V4.5 모델에서만 적용(아니면 기존 태그 생성 폴백). 강도 기본값 고정(strength 0.6/fidelity 1.0, type character&style)
 // @sr-changelog 0.9.4 | display-name에 버전 표기(sns_nai 0.9.4) — 플러그인 목록에서 실제 로드된 버전 확인용. "res.text is not a function"이 계속 보이면 구버전(0.9.1↓)이 캐시돼 있다는 신호이니, 삭제 후 재import 필요(이미지 생성 코드는 0.9.3 견고화 유지). + 이미지 태그 사전 매칭 영속화 수정: ①매칭 시 canonicalName(예: "다온비")까지 프로필 alias로 저장 → 재스캔해도 미매칭으로 안 돌아감 ②수동 매핑 후 동기화 스냅샷 갱신 → 사전 재진입 시 "미매칭 N" 잔류 안 됨
 // @sr-changelog 0.9.3 | ★이미지 생성 핵심 수정 3★ NAI 응답 처리 견고화. RisuAI 내부 매핑상 risuFetch=globalFetch는 표준 Response가 아니라 {ok,data,status} 객체를 반환하고, nativeFetch=fetchNative는 iOS 네이티브에서 Response가 아닌 객체를 줘서 .text()/.arrayBuffer() 호출이 "is not a function"으로 터졌음(스샷 확인). 이제 risuFetch를 무조건 우선 사용(globalFetch는 항상 존재)하고, 응답을 형태 불문(Response·객체 모두)으로 안전하게 읽어 바이너리/에러본문 추출. 빈 응답도 명확히 에러 표시
 // @sr-changelog 0.9.2 | ★이미지 생성 핵심 수정 2★ NAI 호출 전송 계층을 nativeFetch→risuFetch(=globalFetch)로 교체. 본체 "기타 봇>이미지 생성"이 NAI를 정상 호출하는 경로가 바로 globalFetch이며 CORS 우회·프록시 지원으로 iOS(아이폰)에서도 동작. nativeFetch는 iOS RisuAI WebView에서 바이너리 전송이 깨져 이미지 생성이 통째로 실패했음. body는 평문 객체로 넘기고 rawResponse:true로 ZIP 바이너리 수신
@@ -9169,6 +9170,44 @@ ${outputInstruction}`;
     }
   }
 
+  // ★Asset Mommy 연동 — 캐릭터 레퍼런스(director reference)★
+  // Asset Mommy가 "SNS 레퍼런스 지정" 시 캐릭터 globalLore에 comment 'lb-xnai.ref'
+  // 항목(base64 이미지)을 써 둔다. sns_nai는 그걸 읽어 NAI director reference로 실어
+  // 그림체·캐릭터를 유지한 채 상황만 바뀐 이미지를 생성한다. 캐릭터당 1장, 캐릭터 인덱스로 캐시.
+  async _loadCharacterRefImage() {
+    try {
+      let charIdx = -1;
+      try { charIdx = await Risuai.getCurrentCharacterIndex(); } catch {}
+      if (this._refCacheCharIdx === charIdx && this._refCacheLoaded) return this._refImageB64 || null;
+      this._refCacheCharIdx = charIdx;
+      this._refCacheLoaded = true;
+      this._refImageB64 = null;
+      const char = await Risuai.getCharacter();
+      if (!char) return null;
+      const lore = [...(Array.isArray(char.globalLore) ? char.globalLore : [])];
+      try {
+        const chatIdx = await Risuai.getCurrentChatIndex();
+        const chat = char.chats && char.chats[chatIdx];
+        if (chat && Array.isArray(chat.localLore)) lore.push(...chat.localLore);
+      } catch {}
+      const entry = lore.find(e =>
+        e && String(e.comment || '').trim().toLowerCase() === 'lb-xnai.ref');
+      if (!entry || typeof entry.content !== 'string') return null;
+      let b64 = entry.content.trim();
+      const m = b64.match(/^data:image\/[a-z0-9.+-]+;base64,(.+)$/is);
+      if (m) b64 = m[1];
+      b64 = b64.replace(/\s+/g, '');
+      if (b64.length < 64) return null;  // 손상/플레이스홀더 방지
+      this._refImageB64 = b64;
+      return b64;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // 외부(설정 변경/캐릭터 전환)에서 레퍼런스 캐시를 무효화하고 싶을 때.
+  invalidateCharacterRefCache() { this._refCacheLoaded = false; this._refImageB64 = null; }
+
   async _callNAI(prompt, negPrompt, aspect = 'portrait', opts = {}) {
     if (!this.naiKey) return null;
 
@@ -9243,6 +9282,25 @@ ${outputInstruction}`;
         director_reference_strength_values: [],
       },
     };
+
+    // ★캐릭터 레퍼런스 주입★ Asset Mommy가 지정한 레퍼런스가 있고 V4.5 모델이면
+    // director reference로 실어 그림체+캐릭터 유지(상황만 태그로 변동). 기본값 고정:
+    // strength 0.6, fidelity 1.0(=secondary 0). type 'character&style'.
+    try {
+      const refB64 = await this._loadCharacterRefImage();
+      if (refB64 && this._isV45Model()) {
+        const pp = body.parameters;
+        pp.director_reference_images = [refB64];
+        pp.director_reference_strength_values = [0.6];
+        pp.director_reference_secondary_strength_values = [0.0];
+        pp.director_reference_descriptions = [{
+          caption: { base_caption: 'character&style', char_captions: [] },
+          legacy_uc: false,
+        }];
+        pp.director_reference_information_extracted = [1.0];
+        pp.normalize_reference_strength_multiple = true;
+      }
+    } catch (_) { /* 레퍼런스 실패는 일반 태그 생성으로 폴백 */ }
 
     this._lastNaiError = null;  // [sns_nai] 마지막 NAI 에러 저장 (계정 이미지 경로가 표면화)
     try {

@@ -44,8 +44,17 @@ sns_nai: SNS 계정 프로필/배경 → NAI 이미지 생성
 
 이름 매칭 개선: 헤딩의 괄호 안 이름(영문)과 base 이름(한글)을 모두 분리해 양방향 토큰으로 매칭 — 한글/영문 이중표기 캐릭터가 정상 매칭됩니다.
 
+## 캐릭터 레퍼런스 연동 (0.9.5)
+
+Asset Mommy 줌 갤러리에서 이미지를 **"SNS 레퍼런스"로 지정**하면, 그 이미지가 캐릭터 로어북(`lb-xnai.ref`)에 저장됩니다. sns_nai는 SNS 이미지 생성 시 이 레퍼런스를 NAI **director reference**로 실어, 캐릭터 외형·그림체를 유지한 채 상황(태그)만 바뀐 이미지를 만듭니다.
+
+- 캐릭터당 1장, **NAI V4.5 모델(`nai-diffusion-4-5*`)에서만** 동작(아니면 기존 태그 생성으로 폴백)
+- 강도 기본값 고정: strength 0.6 / fidelity 1.0 / type `character&style`
+- 한계: 레퍼런스를 써도 원본 그림체를 100% 복제하진 못함(NAI 모델 한계). 일관성은 확연히 향상.
+
 ## 버전 이력
 
+- `0.9.5`: Asset Mommy 연동 — 캐릭터 레퍼런스(director reference) 사용
 - `0.9.3`: ★NAI 응답 처리 견고화★ `risuFetch`(=globalFetch)는 표준 `Response`가 아니라 `{ok, data, status}` 객체를 반환하고 `nativeFetch`(=fetchNative)는 iOS 네이티브에서 Response가 아닌 객체를 줘서 `.text()`/`.arrayBuffer()`가 터졌음. 이제 risuFetch를 무조건 우선 사용하고 응답을 형태 불문으로 안전하게 읽음.
 - `0.9.2`: ★NAI 이미지 생성 핵심 수정★ NAI 호출 전송 계층을 `nativeFetch`→`risuFetch`(=globalFetch)로 교체. 본체 "기타 봇>이미지 생성"이 NAI를 정상 호출하는 경로가 바로 globalFetch이며 CORS 우회·프록시 지원으로 아이폰(iOS)에서도 동작. nativeFetch는 iOS RisuAI WebView에서 바이너리 전송이 깨져 이미지 생성이 실패했음.
 - `0.9.1`: NAI 엔드포인트 URL 직접 입력칸 추가 (본체 NAIImgUrl을 못 읽는 문제 우회)
